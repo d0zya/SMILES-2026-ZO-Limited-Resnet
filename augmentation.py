@@ -46,9 +46,16 @@ def get_transforms(train: bool) -> T.Compose:
                 # Keep the Resize and Normalize steps; add augmentations
                 # between or around them as appropriate.
                 # ----------------------------------------------------------
-                T.Resize(224),
+                T.RandomCrop(32, padding=4),
                 T.RandomHorizontalFlip(),
-                # Add more augmentations here ↓
+                # T.AutoAugment(T.AutoAugmentPolicy.CIFAR10),
+                T.ColorJitter(
+                    brightness=0.1,
+                    contrast=0.1,
+                    saturation=0.1,
+                    hue=0.02,
+                ),
+                T.Resize(224),
                 T.ToTensor(),
                 T.Normalize(mean=_CIFAR100_MEAN, std=_CIFAR100_STD),
                 # ----------------------------------------------------------

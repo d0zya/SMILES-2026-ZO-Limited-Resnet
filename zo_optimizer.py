@@ -21,7 +21,6 @@ Key design points
 
 from __future__ import annotations
 
-import math
 from typing import Callable
 
 import torch
@@ -38,7 +37,7 @@ class ZeroOrderOptimizer:
 
     Args:
         model:            The ``nn.Module`` to optimize.
-        lr:               Step size / learning rate.
+        lr:               Step size / learning rate.   
         eps:              Perturbation magnitude for the finite-difference
                           estimator.
         perturbation_mode: Distribution used to sample the perturbation
@@ -64,18 +63,34 @@ class ZeroOrderOptimizer:
         model: nn.Module,
         lr: float = 1e-3,
         eps: float = 1e-3,
-        perturbation_mode: str = "gaussian",
+        perturbation_mode: str = "bernoulli",
+        beta1: float = 0.9,
+        beta2: float = 0.999,
+        adam_eps: float = 1e-8,
+        num_directions: int = 4,
+        max_update_norm: float = 0.05,
+        anchor_strength: float = 0.01,
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
-
-        if perturbation_mode not in ("gaussian", "uniform"):
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.adam_eps = adam_eps
+        self.num_directions = num_directions
+        self.max_update_norm = max_update_norm
+        self.anchor_strength = anchor_strength
+        self.step_count = 0
+        
+        if perturbation_mode not in ("gaussian", "uniform","bernoulli"):
             raise ValueError(
-                f"perturbation_mode must be 'gaussian' or 'uniform', "
+                f"perturbation_mode must be 'gaussian' or 'uniform' or 'bernoulli', "
                 f"got '{perturbation_mode}'"
             )
         self.perturbation_mode = perturbation_mode
+
+        self.first_moment: dict[str, torch.Tensor] = {}
+        self.second_moment: dict[str, torch.Tensor] = {}
 
         # ------------------------------------------------------------------
         # STUDENT: Set self.layer_names to the parameters you want to tune.
@@ -87,8 +102,13 @@ class ZeroOrderOptimizer:
         # You can also update self.layer_names inside .step() to implement
         # a dynamic schedule (e.g. gradually unfreeze deeper layers).
         # ------------------------------------------------------------------
-        self.layer_names: list[str] = ["fc.weight", "fc.bias"]
+        self.layer_names: list[str] = ["fc.bias"]
         # ------------------------------------------------------------------
+
+        self.reference_params = {
+            name: param.detach().clone()
+            for name, param in self.model.named_parameters()
+        }
 
     # ------------------------------------------------------------------
     # Internal helpers — students may modify these.
@@ -128,6 +148,10 @@ class ZeroOrderOptimizer:
         """
         if self.perturbation_mode == "gaussian":
             u = torch.randn_like(param)
+        elif self.perturbation_mode == 'bernoulli':
+            u = torch.empty_like(param).bernoulli_(0.5)
+            u = u.mul_(2.0).sub_(1.0)
+            return u
         else:  # uniform
             u = torch.rand_like(param) * 2.0 - 1.0
 
@@ -171,25 +195,29 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the gradient estimation below.
         # ------------------------------------------------------------------
-        grads: dict[str, torch.Tensor] = {}
+        grads = {name: torch.zeros_like(param) for name, param in params.items()}
 
         with torch.no_grad():
-            for name, param in params.items():
-                u = self._sample_direction(param)
+            for _ in range(self.num_directions):
+                directions = {
+                    name: self._sample_direction(param)
+                    for name, param in params.items()
+                }
 
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
+                for name, param in params.items():
+                    param.data.add_(self.eps * directions[name])
                 f_plus = loss_fn()
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
+                for name, param in params.items():
+                    param.data.sub_(2.0 * self.eps * directions[name])
                 f_minus = loss_fn()
 
-                # Restore original value
-                param.data.add_(self.eps * u)
+                for name, param in params.items():
+                    param.data.add_(self.eps * directions[name])
 
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
+                coeff = (f_plus - f_minus) / (2.0 * self.eps)
+                for name in params:
+                    grads[name].add_(coeff * directions[name], alpha=1.0 / self.num_directions)
 
         return grads
         # ------------------------------------------------------------------
@@ -218,9 +246,33 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the parameter update below.
         # ------------------------------------------------------------------
+        self.step_count += 1
+
         with torch.no_grad():
             for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
+                if name not in self.first_moment:
+                    self.first_moment[name] = torch.zeros_like(param)
+                    self.second_moment[name] = torch.zeros_like(param)
+
+                grad = grads[name]
+                m = self.first_moment[name]
+                v = self.second_moment[name]
+
+                m.mul_(self.beta1).add_(grad, alpha=1.0 - self.beta1)
+                v.mul_(self.beta2).addcmul_(grad, grad, value=1.0 - self.beta2)
+
+                m_hat = m / (1.0 - self.beta1 ** self.step_count)
+                v_hat = v / (1.0 - self.beta2 ** self.step_count)
+
+                update = self.lr * m_hat / (torch.sqrt(v_hat) + self.adam_eps)
+                update_norm = update.norm()
+                if update_norm > self.max_update_norm:
+                    update.mul_(self.max_update_norm / update_norm.clamp_min(1e-12))
+
+                param.data.sub_(update)
+
+                if name.endswith("weight") and self.anchor_strength > 0.0:
+                    param.data.lerp_(self.reference_params[name], self.anchor_strength)
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
